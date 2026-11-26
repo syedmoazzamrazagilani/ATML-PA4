@@ -54,13 +54,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data-root", type=str, default="atml-pa4-datasets")
     p.add_argument("--out-dir", type=str, default="results/task1")
     p.add_argument("--resume", action="store_true", help="Skip already-saved conditions")
+    p.add_argument("--smoke-test", action="store_true", help="Fast ~2 min end-to-end verification of every code path")
     p.add_argument("--ppl-batch-size", type=int, default=4)
     p.add_argument("--hs-batch-size", type=int, default=32)
     p.add_argument("--timing-reps", type=int, default=5)
     return p.parse_args()
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def capture_reference_block_outputs(
     model: torch.nn.Module,
     calib_rows: List[Dict[str, Any]],
@@ -87,7 +88,7 @@ def capture_reference_block_outputs(
     return outputs
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def evaluate_block_output_errors(
     model: torch.nn.Module,
     ref_block_outputs: List[torch.Tensor],
@@ -144,13 +145,11 @@ def export_qualitative_hellaswag(
         if p.exists():
             details[c] = json.loads(p.read_text(encoding="utf-8"))["hellaswag_per_example"]
 
-    # Only inspect the first 512 indices (present in every single condition)
     n_common = min(len(v) for v in details.values())
     ranked = []
     for i in range(n_common):
         base_ok = details["baseline_fp16"][i]["correct_norm"]
         n_wrong = sum(1 - details[c][i]["correct_norm"] for c in details if c != "baseline_fp16")
-        # Prefer cases where baseline is right and compressed methods disagree
         score = (10 if base_ok else 0) + (n_wrong if 0 < n_wrong < len(details) - 1 else 0)
         ranked.append((score, i))
     ranked.sort(key=lambda x: (-x[0], x[1]))
@@ -190,6 +189,10 @@ def main() -> None:
     cond_dir = out_dir / "conditions"
     cond_dir.mkdir(parents=True, exist_ok=True)
 
+    smoke = args.smoke_test
+    if smoke:
+        print("=== [Task 1] SMOKE TEST MODE (exercising every condition & assertion on tiny slices) ===", flush=True)
+
     data = PA4Data(args.data_root)
     model_id, model_rev = data.model_spec("model_base")
     print(f"[Task 1] Loading {model_id} @ {model_rev} in FP16...", flush=True)
@@ -200,7 +203,7 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         revision=model_rev,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         attn_implementation="sdpa",
     ).to("cuda").eval()
 
@@ -209,20 +212,41 @@ def main() -> None:
     eligible_shapes = {n: (m.out_features, m.in_features) for n, m in eligible_mods.items()}
     print(f"[Task 1] Parameter accounting: {json.dumps(acct)}", flush=True)
 
-    # Load all locked Task 1 datasets
+    # Load locked datasets (sliced cleanly in smoke-test mode)
     calib_rows = data.c4_calibration()
     dev_rows = data.c4_development()
     wt2_windows = data.wikitext2_test()
     c4_val_windows = data.c4_validation()
     hs_2000_raw = data.hellaswag_val(limit=2000)
+
+    if smoke:
+        calib_rows = calib_rows[:4]
+        dev_rows = dev_rows[:4]
+        wt2_windows = wt2_windows[:4]
+        c4_val_windows = c4_val_windows[:4]
+        hs_2000_raw = hs_2000_raw[:12]
+        timing_reps, timing_warmup = 1, 1
+        awq_grid = [0.0, 0.5, 1.0]
+        q3_coarse_grid = [0.0, 0.5]
+        p3_lambdas = (0.04, 0.08)
+        fisher_seqs = 2
+        block_err_seqs = 2
+    else:
+        timing_reps, timing_warmup = args.timing_reps, 3
+        awq_grid = [round(i * 0.05, 2) for i in range(21)]
+        q3_coarse_grid = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+        p3_lambdas = (0.04, 0.08, 0.12)
+        fisher_seqs = 64
+        block_err_seqs = 8
+
     hs_2000_prep = prepare_hellaswag_tokenized(hs_2000_raw, tokenizer)
     hs_512_prep = hs_2000_prep[:512]
 
-    # Save metadata & CPU snapshot of untouched FP16 weights
     meta = collect_run_metadata(
         Path(args.data_root),
         extra={
             "task": "task1_model_compression",
+            "smoke_test": smoke,
             "model_id": model_id,
             "model_revision": model_rev,
             "precision": "torch.float16",
@@ -234,10 +258,8 @@ def main() -> None:
     save_json(out_dir / "run_metadata.json", meta)
     orig_snapshot = snapshot_model_weights_cpu(model)
 
-    # Capture unchanged FP16 block outputs for folding-invariant distortion tracking
-    ref_block_outputs = capture_reference_block_outputs(model, calib_rows, num_seqs=8)
+    ref_block_outputs = capture_reference_block_outputs(model, calib_rows, num_seqs=block_err_seqs)
 
-    # Collect shared calibration statistics once (128 x 512 C4 sequences)
     t0 = time.perf_counter()
     calib_stats = collect_calibration_stats(model, calib_rows, sample_tokens_per_seq=16, batch_size=4)
     calib_time_s = time.perf_counter() - t0
@@ -256,17 +278,18 @@ def main() -> None:
         c4v = evaluate_perplexity_windows(model, c4_val_windows, batch_size=args.ppl_batch_size)
         hs_prep = hs_2000_prep if full_hellaswag else hs_512_prep
         hs = evaluate_hellaswag(model, hs_prep, pad_token_id=pad_id, batch_size=args.hs_batch_size)
-        latency = benchmark_dense_fp16_latency(model, vocab_size=model.config.vocab_size, reps=args.timing_reps)
+        latency = benchmark_dense_fp16_latency(
+            model, vocab_size=model.config.vocab_size, reps=timing_reps, warmup=timing_warmup,
+        )
         layer_err = (
             compute_calibration_layer_errors(orig_snapshot, model, calib_stats["x_samples"])
             if measure_proj_err else None
         )
         block_err = (
-            evaluate_block_output_errors(model, ref_block_outputs, calib_rows, num_seqs=8)
+            evaluate_block_output_errors(model, ref_block_outputs, calib_rows, num_seqs=block_err_seqs)
             if measure_block_err else None
         )
 
-        # Save heavy per-example & per-window diagnostics separately, keep summary compact
         save_json(
             cond_dir / f"{cond_name}_details.json",
             {
@@ -309,16 +332,19 @@ def main() -> None:
         return summary
 
     def already_done(cond_name: str) -> bool:
-        return args.resume and (cond_dir / f"{cond_name}.json").exists() and (cond_dir / f"{cond_name}_details.json").exists()
+        return (
+            not smoke
+            and args.resume
+            and (cond_dir / f"{cond_name}.json").exists()
+            and (cond_dir / f"{cond_name}_details.json").exists()
+        )
 
     def load_done(cond_name: str) -> Dict[str, Any]:
         return json.loads((cond_dir / f"{cond_name}.json").read_text(encoding="utf-8"))
 
     all_summaries: Dict[str, Dict[str, Any]] = {}
 
-    # =========================================================================
     # 1. FP16 Baseline
-    # =========================================================================
     if not already_done("baseline_fp16"):
         restore_model_weights(model, orig_snapshot)
         st = compute_sparse_storage_bytes(model, acct)
@@ -332,9 +358,7 @@ def main() -> None:
     else:
         all_summaries["baseline_fp16"] = load_done("baseline_fp16")
 
-    # =========================================================================
     # 2. P1: Uniform Magnitude Pruning (25%, 50%, 75%)
-    # =========================================================================
     for s in (0.25, 0.50, 0.75):
         cname = f"P1_mag_s{int(s*100)}"
         if not already_done(cname):
@@ -351,9 +375,7 @@ def main() -> None:
         else:
             all_summaries[cname] = load_done(cname)
 
-    # =========================================================================
-    # 3. P2: Uniform Wanda Pruning (25%, 50%, 75%) + 2:4 Structured Diagnostic
-    # =========================================================================
+    # 3. P2: Uniform Wanda Pruning (25%, 50%, 75%) + 2:4 Diagnostic
     for s in (0.25, 0.50, 0.75):
         cname = f"P2_wanda_s{int(s*100)}"
         if not already_done(cname):
@@ -370,7 +392,6 @@ def main() -> None:
         else:
             all_summaries[cname] = load_done(cname)
 
-    # Step 8: 2:4 Structured Wanda Diagnostic (50% sparsity)
     if not already_done("P2_wanda_2to4_s50"):
         restore_model_weights(model, orig_snapshot)
         t_c = time.perf_counter()
@@ -385,10 +406,7 @@ def main() -> None:
     else:
         all_summaries["P2_wanda_2to4_s50"] = load_done("P2_wanda_2to4_s50")
 
-    # =========================================================================
-    # 4. P3: Nonuniform Wanda Pruning (50%, 75%) — Dev Selection on 32 C4 Seqs
-    # =========================================================================
-    p3_dev_log: Dict[str, Any] = {}
+    # 4. P3: Nonuniform Wanda Pruning (50%, 75%)
     for s in (0.50, 0.75):
         cname = f"P3_nonuniform_wanda_s{int(s*100)}"
         if not already_done(cname):
@@ -401,7 +419,7 @@ def main() -> None:
             candidates = []
             best_cand = None
             for probe_name in ("owl_outlier_ratio", "calib_distortion"):
-                for lam in (0.04, 0.08, 0.12):
+                for lam in p3_lambdas:
                     restore_model_weights(model, orig_snapshot)
                     alloc_map, row_zeros, residual = allocate_nonuniform_sparsities(
                         eligible_shapes, sens_dict[probe_name], target_sparsity=s, lam=lam,
@@ -425,15 +443,16 @@ def main() -> None:
                         best_cand = {**cand_rec, "row_zeros": row_zeros, "residual": residual}
 
             assert best_cand is not None
-            p3_dev_log[f"s{int(s*100)}"] = {
-                "probe_time_s": probe_time,
-                "sensitivities": sens_dict,
-                "dev_candidates": candidates,
-                "selected": {k: v for k, v in best_cand.items() if k != "row_zeros"},
-            }
-            save_json(out_dir / f"p3_selection_s{int(s*100)}.json", p3_dev_log[f"s{int(s*100)}"])
+            save_json(
+                out_dir / f"p3_selection_s{int(s*100)}.json",
+                {
+                    "probe_time_s": probe_time,
+                    "sensitivities": sens_dict,
+                    "dev_candidates": candidates,
+                    "selected": {k: v for k, v in best_cand.items() if k != "row_zeros"},
+                },
+            )
 
-            # Apply selected P3 allocation and run held-out evaluations
             restore_model_weights(model, orig_snapshot)
             t_c = time.perf_counter()
             apply_info = apply_nonuniform_wanda(
@@ -460,9 +479,7 @@ def main() -> None:
         else:
             all_summaries[cname] = load_done(cname)
 
-    # =========================================================================
     # 5. Q1: Uniform Asymmetric Group-128 PTQ (8, 4, 3 bits)
-    # =========================================================================
     for b in (8, 4, 3):
         cname = f"Q1_uniform_int{b}"
         if not already_done(cname):
@@ -479,9 +496,7 @@ def main() -> None:
         else:
             all_summaries[cname] = load_done(cname)
 
-    # =========================================================================
     # 6. Q2: Activation-Aware Weight Quantization (AWQ) (8, 4, 3 bits)
-    # =========================================================================
     verify_ids = torch.tensor([calib_rows[0]["token_ids"]], dtype=torch.long, device="cuda")
     q2_unfolded_counts: Dict[str, int] = {
         n: eligible_shapes[n][1] for n in eligible_shapes if n.endswith("self_attn.o_proj")
@@ -494,7 +509,7 @@ def main() -> None:
             bit_map = {n: b for n in eligible_shapes}
             awq_info = apply_awq_with_bitmap(
                 model, bit_map, calib_stats["x_abs_mean"], calib_stats["x_samples"],
-                group_size=128, verify_pre_quant_calib_ids=verify_ids,
+                group_size=128, alpha_grid=awq_grid, verify_pre_quant_calib_ids=verify_ids,
             )
             dt = time.perf_counter() - t_c
             q2_unfolded_counts = awq_info["unfolded_scale_counts"]
@@ -502,8 +517,6 @@ def main() -> None:
                 eligible_shapes, bit_map, acct, group_size=128,
                 unfolded_scale_counts=q2_unfolded_counts,
             )
-            # Note: measure_proj_err=False because AWQ folds scales into layernorms/up_proj;
-            # block_calib_error captures the exact folding-invariant output distortion.
             all_summaries[cname] = eval_and_save(
                 cname, full_hellaswag=(b in (4, 3)), storage_info=st,
                 extra_info={
@@ -521,13 +534,11 @@ def main() -> None:
         else:
             all_summaries[cname] = load_done(cname)
 
-    # =========================================================================
     # 7. Q3: Mixed Precision AWQ (Matched to Q2 INT4 and Q2 INT3 Packed Bytes)
-    # =========================================================================
     need_q3 = any(not already_done(f"Q3_mixed_awq_budget_int{b}") for b in (4, 3))
     if need_q3:
         sens_cache_path = out_dir / "q3_sensitivity_tables.json"
-        if args.resume and sens_cache_path.exists():
+        if not smoke and args.resume and sens_cache_path.exists():
             raw_tables = json.loads(sens_cache_path.read_text(encoding="utf-8"))
             sens_tables = {
                 probe: {proj: {int(bk): float(bv) for bk, bv in bdict.items()} for proj, bdict in pdict.items()}
@@ -540,9 +551,10 @@ def main() -> None:
             clear_cuda()
             t_q3_probe = time.perf_counter()
             print("[Task 1] Computing diagonal Fisher & AWQ distortion tables for Q3...", flush=True)
-            fisher_diag = compute_diagonal_fisher_calibration(model, calib_rows, num_seqs=64)
+            fisher_diag = compute_diagonal_fisher_calibration(model, calib_rows, num_seqs=fisher_seqs)
             sens_tables = compute_quant_sensitivity_tables(
-                model, orig_snapshot, calib_stats["x_abs_mean"], calib_stats["x_samples"], fisher_diag,
+                model, orig_snapshot, calib_stats["x_abs_mean"], calib_stats["x_samples"],
+                fisher_diag, coarse_grid=q3_coarse_grid,
             )
             q3_probe_time = time.perf_counter() - t_q3_probe
             save_json(sens_cache_path, sens_tables)
@@ -572,7 +584,8 @@ def main() -> None:
                 )
                 restore_model_weights(model, orig_snapshot)
                 apply_awq_with_bitmap(
-                    model, bit_map, calib_stats["x_abs_mean"], calib_stats["x_samples"], group_size=128,
+                    model, bit_map, calib_stats["x_abs_mean"], calib_stats["x_samples"],
+                    group_size=128, alpha_grid=awq_grid,
                 )
                 dev_nll = evaluate_dev_nll(model, dev_rows, batch_size=args.ppl_batch_size)
                 st_cand = compute_quant_storage_bytes(
@@ -610,7 +623,7 @@ def main() -> None:
             t_c = time.perf_counter()
             awq_info = apply_awq_with_bitmap(
                 model, best_q3["bit_map"], calib_stats["x_abs_mean"], calib_stats["x_samples"],
-                group_size=128, verify_pre_quant_calib_ids=verify_ids,
+                group_size=128, alpha_grid=awq_grid, verify_pre_quant_calib_ids=verify_ids,
             )
             dt = q3_probe_time + (time.perf_counter() - t_c)
             st = compute_quant_storage_bytes(
@@ -640,9 +653,7 @@ def main() -> None:
             cname = f"Q3_mixed_awq_budget_int{target_b}"
             all_summaries[cname] = load_done(cname)
 
-    # =========================================================================
     # 8. Paired 95% Bootstrap CIs for P3-P2 and Q3-Q2 + Qualitative Export
-    # =========================================================================
     pairs = [
         ("P3_nonuniform_wanda_s50", "P2_wanda_s50"),
         ("P3_nonuniform_wanda_s75", "P2_wanda_s75"),
@@ -677,7 +688,8 @@ def main() -> None:
     )
     save_json(out_dir / "paired_bootstrap_cis.json", boot_results)
     save_json(out_dir / "summary_all_conditions.json", all_summaries)
-    print("\n[Task 1] COMPLETE! Saved summary_all_conditions.json, paired_bootstrap_cis.json, and qualitative_hellaswag_cases.json.", flush=True)
+    tag = "SMOKE TEST PASSED" if smoke else "COMPLETE"
+    print(f"\n[Task 1] {tag}! Saved summary_all_conditions.json, paired_bootstrap_cis.json, and qualitative_hellaswag_cases.json.", flush=True)
 
 
 if __name__ == "__main__":
