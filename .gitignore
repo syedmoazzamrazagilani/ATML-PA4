@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+atml-pa4-datasets/
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.safetensors
+.DS_Store
