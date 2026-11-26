@@ -46,6 +46,7 @@ def quantize_dequantize_groupwise_asym(
     return w_hat.to(orig_dtype)
 
 
+@torch.no_grad()
 def apply_q1_uniform_ptq(
     model: nn.Module,
     bits: int,
@@ -55,19 +56,18 @@ def apply_q1_uniform_ptq(
     eligible = get_eligible_modules(model)
     bit_map: Dict[str, int] = {}
     for name, mod in eligible.items():
-        mod.weight.data = quantize_dequantize_groupwise_asym(mod.weight.data, bits=bits, group_size=group_size)
+        mod.weight.data.copy_(quantize_dequantize_groupwise_asym(mod.weight.data, bits=bits, group_size=group_size))
         bit_map[name] = bits
     return bit_map
 
 
 def _awq_scale_from_alpha(x_abs_mean: torch.Tensor, alpha: float) -> torch.Tensor:
     s = x_abs_mean.clamp_min(1e-5).pow(alpha)
-    # Normalize geometric scale so dynamic range stays centered (standard AWQ normalization)
     s = s / torch.sqrt(s.max() * s.min()).clamp_min(1e-5)
     return s
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def search_awq_group_scale(
     weights: List[torch.Tensor],
     bits_list: List[int],
@@ -93,7 +93,6 @@ def search_awq_group_scale(
 
     for alpha in alpha_grid:
         s = _awq_scale_from_alpha(x_mean, alpha)
-        s_fp16 = s.to(torch.float16)
         inv_s_fp16 = (1.0 / s).to(torch.float16)
         x_scaled = x * inv_s_fp16.unsqueeze(0)
 
@@ -112,7 +111,7 @@ def search_awq_group_scale(
     return best_alpha, best_s, best_loss
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def apply_awq_with_bitmap(
     model: nn.Module,
     bit_map: Dict[str, int],
@@ -134,7 +133,6 @@ def apply_awq_with_bitmap(
     if alpha_grid is None:
         alpha_grid = [round(i * 0.05, 2) for i in range(21)]
 
-    # Reference logits before folding/quantization (if equivalence check requested)
     ref_logits = None
     if verify_pre_quant_calib_ids is not None:
         ref_logits = model(input_ids=verify_pre_quant_calib_ids, use_cache=False).logits.float().cpu()
@@ -161,9 +159,11 @@ def apply_awq_with_bitmap(
             x_samples[q_name], x_abs_mean[q_name], group_size=group_size, alpha_grid=alpha_grid,
         )
         chosen_alphas[f"{prefix}.qkv_shared"] = a_qkv
-        layer.input_layernorm.weight.data = (layer.input_layernorm.weight.data.float() / s_qkv).to(torch.float16)
+        layer.input_layernorm.weight.data.copy_(
+            (layer.input_layernorm.weight.data.float() / s_qkv).to(torch.float16)
+        )
         for proj in (layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj):
-            proj.weight.data = (proj.weight.data.float() * s_qkv.unsqueeze(0)).to(torch.float16)
+            proj.weight.data.copy_((proj.weight.data.float() * s_qkv.unsqueeze(0)).to(torch.float16))
 
         # 1b. o_proj scale -> serialized compensating FP16 inverse scale
         a_o, s_o, _ = search_awq_group_scale(
@@ -180,10 +180,16 @@ def apply_awq_with_bitmap(
             x_samples[d_name], x_abs_mean[d_name], group_size=group_size, alpha_grid=alpha_grid,
         )
         chosen_alphas[d_name] = a_d
-        layer.mlp.up_proj.weight.data = (layer.mlp.up_proj.weight.data.float() / s_d.unsqueeze(1)).to(torch.float16)
+        layer.mlp.up_proj.weight.data.copy_(
+            (layer.mlp.up_proj.weight.data.float() / s_d.unsqueeze(1)).to(torch.float16)
+        )
         if layer.mlp.up_proj.bias is not None:
-            layer.mlp.up_proj.bias.data = (layer.mlp.up_proj.bias.data.float() / s_d).to(torch.float16)
-        layer.mlp.down_proj.weight.data = (layer.mlp.down_proj.weight.data.float() * s_d.unsqueeze(0)).to(torch.float16)
+            layer.mlp.up_proj.bias.data.copy_(
+                (layer.mlp.up_proj.bias.data.float() / s_d).to(torch.float16)
+            )
+        layer.mlp.down_proj.weight.data.copy_(
+            (layer.mlp.down_proj.weight.data.float() * s_d.unsqueeze(0)).to(torch.float16)
+        )
 
         # 1d. gate/up shared scale -> fold inverse into post_attention_layernorm
         a_gu, s_gu, _ = search_awq_group_scale(
@@ -192,11 +198,15 @@ def apply_awq_with_bitmap(
             x_samples[g_name], x_abs_mean[g_name], group_size=group_size, alpha_grid=alpha_grid,
         )
         chosen_alphas[f"{prefix}.gate_up_shared"] = a_gu
-        layer.post_attention_layernorm.weight.data = (
-            layer.post_attention_layernorm.weight.data.float() / s_gu
-        ).to(torch.float16)
-        layer.mlp.gate_proj.weight.data = (layer.mlp.gate_proj.weight.data.float() * s_gu.unsqueeze(0)).to(torch.float16)
-        layer.mlp.up_proj.weight.data = (layer.mlp.up_proj.weight.data.float() * s_gu.unsqueeze(0)).to(torch.float16)
+        layer.post_attention_layernorm.weight.data.copy_(
+            (layer.post_attention_layernorm.weight.data.float() / s_gu).to(torch.float16)
+        )
+        layer.mlp.gate_proj.weight.data.copy_(
+            (layer.mlp.gate_proj.weight.data.float() * s_gu.unsqueeze(0)).to(torch.float16)
+        )
+        layer.mlp.up_proj.weight.data.copy_(
+            (layer.mlp.up_proj.weight.data.float() * s_gu.unsqueeze(0)).to(torch.float16)
+        )
 
     # Verify full-precision folding equivalence BEFORE quantization rounding
     equiv_stats = None
@@ -216,10 +226,9 @@ def apply_awq_with_bitmap(
             s_o = o_proj_scales[name]
             w_scaled = (mod.weight.data.float() * s_o.unsqueeze(0)).to(torch.float16)
             w_q = quantize_dequantize_groupwise_asym(w_scaled, bits=b, group_size=group_size)
-            # Reconstruct effective weight W_q * diag(1/s_o) for dense FP16 numerical evaluation
-            mod.weight.data = (w_q.float() / s_o.unsqueeze(0)).to(torch.float16)
+            mod.weight.data.copy_((w_q.float() / s_o.unsqueeze(0)).to(torch.float16))
         else:
-            mod.weight.data = quantize_dequantize_groupwise_asym(mod.weight.data, bits=b, group_size=group_size)
+            mod.weight.data.copy_(quantize_dequantize_groupwise_asym(mod.weight.data, bits=b, group_size=group_size))
 
     return {
         "alpha_grid": alpha_grid,
@@ -233,42 +242,59 @@ def compute_diagonal_fisher_calibration(
     model: nn.Module,
     calib_rows: List[Dict[str, Any]],
     num_seqs: int = 64,
+    loss_scale: float = 512.0,
     device: str = "cuda",
 ) -> Dict[str, torch.Tensor]:
     """
     Compute diagonal empirical Fisher information E[(dL/dW)^2] on calibration sequences
     for HAWQ/Molchanov-inspired mixed-precision quantization sensitivity.
-    Only eligible projections require gradients to keep VRAM low on T4.
+    Uses fixed loss scaling to prevent FP16 gradient underflow and guards against non-finite grads.
     """
     model.eval()
     eligible = get_eligible_modules(model)
     for p in model.parameters():
         p.requires_grad_(False)
     for mod in eligible.values():
-        mod.weight.requires_grad_(True)
+        if mod.weight.is_inference():
+            mod.weight = nn.Parameter(mod.weight.detach().clone(), requires_grad=True)
+        else:
+            mod.weight.requires_grad_(True)
 
     fisher = {n: torch.zeros_like(mod.weight, dtype=torch.float32, device="cpu") for n, mod in eligible.items()}
     used = min(num_seqs, len(calib_rows))
+    valid_steps = 0
 
-    for i in range(used):
-        ids = torch.tensor([calib_rows[i]["token_ids"]], dtype=torch.long, device=device)
-        model.zero_grad(set_to_none=True)
-        out = model(input_ids=ids, labels=ids, use_cache=False)
-        out.loss.backward()
-        for name, mod in eligible.items():
-            if mod.weight.grad is not None:
-                fisher[name] += mod.weight.grad.detach().float().pow(2).cpu()
+    with torch.enable_grad():
+        for i in range(used):
+            ids = torch.tensor([calib_rows[i]["token_ids"]], dtype=torch.long, device=device)
+            model.zero_grad(set_to_none=True)
+            out = model(input_ids=ids, labels=ids, use_cache=False)
+            (out.loss * loss_scale).backward()
+
+            step_ok = True
+            for mod in eligible.values():
+                if mod.weight.grad is None or not torch.isfinite(mod.weight.grad).all():
+                    step_ok = False
+                    break
+            if not step_ok:
+                continue
+
+            valid_steps += 1
+            for name, mod in eligible.items():
+                g = mod.weight.grad.detach().float() / loss_scale
+                fisher[name] += g.pow(2).cpu()
 
     model.zero_grad(set_to_none=True)
     for p in model.parameters():
         p.requires_grad_(False)
 
+    denom = float(max(valid_steps, 1))
     for name in fisher:
-        fisher[name] /= float(used)
+        fisher[name] /= denom
     return fisher
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def compute_quant_sensitivity_tables(
     model: nn.Module,
     orig_weights: Dict[str, torch.Tensor],
@@ -302,7 +328,7 @@ def compute_quant_sensitivity_tables(
             )
             w_scaled = (w.float() * s.unsqueeze(0)).to(torch.float16)
             w_q = quantize_dequantize_groupwise_asym(w_scaled, bits=b, group_size=group_size)
-            w_eff = (w_q.float() / s.unsqueeze(0))
+            w_eff = w_q.float() / s.unsqueeze(0)
             delta_sq = (w.float() - w_eff).pow(2)
             fisher_err = float(0.5 * (f_diag * delta_sq).sum().item())
 
@@ -347,7 +373,6 @@ def solve_mixed_precision_knapsack(
         f"Even min bit width {b_min} ({used_bytes} B) exceeds target ({target_eligible_bytes} B)"
     )
 
-    # Iteratively apply best feasible upgrade (checking all higher bit widths to handle non-convex jumps)
     while True:
         best_gain_per_byte = -1.0
         best_move: Tuple[str, int, int] | None = None
