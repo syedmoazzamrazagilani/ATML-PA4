@@ -141,7 +141,6 @@ def apply_awq_with_bitmap(
     unfolded_scale_counts: Dict[str, int] = {}
     o_proj_scales: Dict[str, torch.Tensor] = {}
 
-    # Phase 1: Search and apply exact full-precision rescaling/folding (NO quantization yet)
     for layer_idx, layer in enumerate(model.model.layers):
         prefix = f"model.layers.{layer_idx}"
         q_name = f"{prefix}.self_attn.q_proj"
@@ -208,7 +207,6 @@ def apply_awq_with_bitmap(
             (layer.mlp.up_proj.weight.data.float() * s_gu.unsqueeze(0)).to(torch.float16)
         )
 
-    # Verify full-precision folding equivalence BEFORE quantization rounding
     equiv_stats = None
     if verify_pre_quant_calib_ids is not None and ref_logits is not None:
         folded_logits = model(input_ids=verify_pre_quant_calib_ids, use_cache=False).logits.float().cpu()
@@ -218,7 +216,6 @@ def apply_awq_with_bitmap(
             "pre_quant_mean_abs_logit_diff": float(diff.mean().item()),
         }
 
-    # Phase 2: Quantize all eligible projections with the identical Q1 quantizer
     eligible = get_eligible_modules(model)
     for name, mod in eligible.items():
         b = int(bit_map[name])
@@ -242,13 +239,12 @@ def compute_diagonal_fisher_calibration(
     model: nn.Module,
     calib_rows: List[Dict[str, Any]],
     num_seqs: int = 64,
-    loss_scale: float = 512.0,
     device: str = "cuda",
 ) -> Dict[str, torch.Tensor]:
     """
     Compute diagonal empirical Fisher information E[(dL/dW)^2] on calibration sequences
     for HAWQ/Molchanov-inspired mixed-precision quantization sensitivity.
-    Uses fixed loss scaling to prevent FP16 gradient underflow and guards against non-finite grads.
+    Tries loss_scale=16.0 and falls back to 1.0 if FP16 grads overflow.
     """
     model.eval()
     eligible = get_eligible_modules(model)
@@ -267,30 +263,33 @@ def compute_diagonal_fisher_calibration(
     with torch.enable_grad():
         for i in range(used):
             ids = torch.tensor([calib_rows[i]["token_ids"]], dtype=torch.long, device=device)
-            model.zero_grad(set_to_none=True)
-            out = model(input_ids=ids, labels=ids, use_cache=False)
-            (out.loss * loss_scale).backward()
+            for scale_try in (16.0, 1.0):
+                model.zero_grad(set_to_none=True)
+                out = model(input_ids=ids, labels=ids, use_cache=False)
+                (out.loss * scale_try).backward()
 
-            step_ok = True
-            for mod in eligible.values():
-                if mod.weight.grad is None or not torch.isfinite(mod.weight.grad).all():
-                    step_ok = False
+                step_ok = all(
+                    mod.weight.grad is not None and torch.isfinite(mod.weight.grad).all()
+                    for mod in eligible.values()
+                )
+                if step_ok:
+                    valid_steps += 1
+                    for name, mod in eligible.items():
+                        g = mod.weight.grad.detach().float() / scale_try
+                        fisher[name] += g.pow(2).cpu()
                     break
-            if not step_ok:
-                continue
-
-            valid_steps += 1
-            for name, mod in eligible.items():
-                g = mod.weight.grad.detach().float() / loss_scale
-                fisher[name] += g.pow(2).cpu()
 
     model.zero_grad(set_to_none=True)
     for p in model.parameters():
         p.requires_grad_(False)
 
-    denom = float(max(valid_steps, 1))
+    assert valid_steps > 0, "Diagonal Fisher calibration had 0 valid finite backward steps!"
     for name in fisher:
-        fisher[name] /= denom
+        fisher[name] /= float(valid_steps)
+
+    total_f = sum(float(t.sum().item()) for t in fisher.values())
+    assert total_f > 0.0, "Diagonal Fisher matrix is identically zero!"
+    print(f"[Task 1] Diagonal Fisher completed: {valid_steps}/{used} valid seqs (sum={total_f:.4e})", flush=True)
     return fisher
 
 
@@ -303,6 +302,7 @@ def compute_quant_sensitivity_tables(
     fisher_diag: Dict[str, torch.Tensor],
     allowed_bits: Tuple[int, ...] = (2, 3, 4, 8),
     group_size: int = 128,
+    coarse_grid: List[float] | None = None,
     device: str = "cuda",
 ) -> Dict[str, Dict[str, Dict[int, float]]]:
     """
@@ -314,7 +314,8 @@ def compute_quant_sensitivity_tables(
     eligible = get_eligible_modules(model)
     mse_table: Dict[str, Dict[int, float]] = {n: {} for n in eligible}
     fisher_table: Dict[str, Dict[int, float]] = {n: {} for n in eligible}
-    coarse_grid = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    if coarse_grid is None:
+        coarse_grid = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
 
     for name, mod in eligible.items():
         w = orig_weights[name + ".weight"].to(device=device, dtype=torch.float16)
